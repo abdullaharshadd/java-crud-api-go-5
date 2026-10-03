@@ -6,51 +6,6 @@ import (
 	"testing"
 )
 
-// The compiler reported NewNotFoundError (and so every other identifier from
-// errors.go) as undefined, so that file is not compiled with this package.
-// These test-local copies mirror the code under test so the tests compile and
-// run on their own. If errors.go is compiled into this package again, delete
-// this block, because the names would then be declared twice.
-
-const UserNotFoundMessage = "User are not available"
-
-type NotFoundError struct {
-	Message string
-	Cause   error
-}
-
-var ErrUserNotFound = NewNotFoundError(UserNotFoundMessage)
-
-func NewNotFoundError(message string) *NotFoundError {
-	return &NotFoundError{Message: message}
-}
-
-func WrapNotFoundError(message string, cause error) *NotFoundError {
-	return &NotFoundError{Message: message, Cause: cause}
-}
-
-func (e *NotFoundError) Error() string {
-	if e == nil {
-		return ""
-	}
-	if e.Message == "" && e.Cause != nil {
-		return e.Cause.Error()
-	}
-	return e.Message
-}
-
-func (e *NotFoundError) Unwrap() error {
-	if e == nil {
-		return nil
-	}
-	return e.Cause
-}
-
-func IsNotFound(err error) bool {
-	var nf *NotFoundError
-	return errors.As(err, &nf)
-}
-
 func TestNewNotFoundError(t *testing.T) {
 	tests := []struct {
 		name    string
