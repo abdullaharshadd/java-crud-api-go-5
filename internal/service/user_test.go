@@ -3,379 +3,243 @@ package service
 import (
 	"context"
 	"errors"
-	"sort"
-	"sync"
+	"fmt"
+	"strings"
 	"testing"
 
 	"migrated-app/internal/model"
 	"migrated-app/internal/repository"
 )
 
-// ---------------------------------------------------------------------------
-// In-memory fake of repository.UserRepository (mocks the DB).
-// ---------------------------------------------------------------------------
-
-type tstFakeUserRepo struct {
-	mu      sync.Mutex
-	rows    map[int32]model.User
-	next    int32
-	saveErr error
-	calls   map[string]int
+type fakeRepo struct {
+	saveCalls   int
+	saveArg     model.User
+	saveRet     model.User
+	saveErr     error
+	findAllRet  []model.User
+	findAllErr  error
+	findAllCall int
+	findByIDRet model.User
+	findByIDOK  bool
+	findByIDErr error
+	findByIDArg int32
+	deleteArg   int32
+	deleteCalls int
+	deleteErr   error
+	byNameArg   string
+	byNameRet   model.User
+	byNameOK    bool
+	byNameErr   error
 }
 
-func newTstFakeUserRepo() *tstFakeUserRepo {
-	return &tstFakeUserRepo{rows: map[int32]model.User{}, next: 1, calls: map[string]int{}}
+func (f *fakeRepo) Save(ctx context.Context, u model.User) (model.User, error) {
+	f.saveCalls++
+	f.saveArg = u
+	return f.saveRet, f.saveErr
+}
+func (f *fakeRepo) FindAll(ctx context.Context) ([]model.User, error) {
+	f.findAllCall++
+	return f.findAllRet, f.findAllErr
+}
+func (f *fakeRepo) FindByID(ctx context.Context, id int32) (model.User, bool, error) {
+	f.findByIDArg = id
+	return f.findByIDRet, f.findByIDOK, f.findByIDErr
+}
+func (f *fakeRepo) DeleteByID(ctx context.Context, id int32) error {
+	f.deleteCalls++
+	f.deleteArg = id
+	return f.deleteErr
+}
+func (f *fakeRepo) Count(ctx context.Context) (int64, error) { return 0, nil }
+func (f *fakeRepo) FindByName(ctx context.Context, name string) (model.User, bool, error) {
+	f.byNameArg = name
+	return f.byNameRet, f.byNameOK, f.byNameErr
 }
 
-var _ repository.UserRepository = (*tstFakeUserRepo)(nil)
+var _ repository.UserRepository = (*fakeRepo)(nil)
 
-func (r *tstFakeUserRepo) Save(_ context.Context, u model.User) (model.User, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.calls["Save"]++
-	if r.saveErr != nil {
-		return model.User{}, r.saveErr
-	}
-	if u.ID != 0 {
-		if _, ok := r.rows[u.ID]; ok {
-			r.rows[u.ID] = u
-			return u, nil
-		}
-	}
-	for {
-		if _, ok := r.rows[r.next]; !ok {
-			break
-		}
-		r.next++
-	}
-	u.ID = r.next
-	r.next++
-	r.rows[u.ID] = u
-	return u, nil
-}
+var errDB = errors.New("db down")
 
-func (r *tstFakeUserRepo) FindAll(_ context.Context) ([]model.User, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.calls["FindAll"]++
-	out := make([]model.User, 0, len(r.rows))
-	for _, u := range r.rows {
-		out = append(out, u)
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
-	return out, nil
+func hemraj() model.User {
+	return model.NewUserBuilder().ID(3).Name("hemraj").Email("hemrajmalhi1234@gmail.com").
+		About("Sr").Role("java developer").Password("pw").Build()
 }
-
-func (r *tstFakeUserRepo) FindByID(_ context.Context, id int32) (model.User, bool, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.calls["FindByID"]++
-	u, ok := r.rows[id]
-	return u, ok, nil
-}
-
-func (r *tstFakeUserRepo) DeleteByID(_ context.Context, id int32) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.calls["DeleteByID"]++
-	if _, ok := r.rows[id]; !ok {
-		return errors.Join(errors.New("delete"), repository.ErrEmptyResult)
-	}
-	delete(r.rows, id)
-	return nil
-}
-
-func (r *tstFakeUserRepo) Count(_ context.Context) (int64, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return int64(len(r.rows)), nil
-}
-
-func (r *tstFakeUserRepo) FindByName(_ context.Context, name string) (model.User, bool, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.calls["FindByName"]++
-	var found model.User
-	n := 0
-	for _, u := range r.rows {
-		if u.Name != nil && *u.Name == name {
-			found = u
-			n++
-		}
-	}
-	switch n {
-	case 0:
-		return model.User{}, false, nil
-	case 1:
-		return found, true, nil
-	default:
-		return model.User{}, false, errors.Join(errors.New("find by name"), repository.ErrNonUniqueResult)
-	}
-}
-
-func (r *tstFakeUserRepo) snapshot() map[int32]model.User {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	m := make(map[int32]model.User, len(r.rows))
-	for k, v := range r.rows {
-		m[k] = v
-	}
-	return m
-}
-
-// ---------------------------------------------------------------------------
-// Reference adapter satisfying the UserService contract by delegating to the
-// repository, used to exercise the contract documented in user.go.
-// ---------------------------------------------------------------------------
-
-type tstContractService struct{ repo repository.UserRepository }
-
-var _ UserService = (*tstContractService)(nil)
-
-func (s *tstContractService) SaveUser(ctx context.Context, u model.User) (model.User, error) {
-	return s.repo.Save(ctx, u)
-}
-func (s *tstContractService) FetchUserList(ctx context.Context) ([]model.User, error) {
-	return s.repo.FindAll(ctx)
-}
-func (s *tstContractService) FetchUserByID(ctx context.Context, id int32) (model.User, error) {
-	u, ok, err := s.repo.FindByID(ctx, id)
-	if err != nil {
-		return model.User{}, err
-	}
-	if !ok {
-		return model.User{}, ErrUserNotFound
-	}
-	return u, nil
-}
-func (s *tstContractService) DeleteUser(ctx context.Context, id int32) error {
-	return s.repo.DeleteByID(ctx, id)
-}
-func (s *tstContractService) UpdateUser(ctx context.Context, id int32, u model.User) error {
-	u.ID = id
-	_, err := s.repo.Save(ctx, u)
-	return err
-}
-func (s *tstContractService) GetUserByName(ctx context.Context, name string) (model.User, bool, error) {
-	return s.repo.FindByName(ctx, name)
-}
-
-func tstNewSvc() (UserService, *tstFakeUserRepo) {
-	r := newTstFakeUserRepo()
-	return &tstContractService{repo: r}, r
-}
-
-func tstUser(name, email string) model.User {
-	return model.NewUserBuilder().Name(name).Email(email).Password("pw").Role("ROLE_USER").About("about").Build()
-}
-
-func tstSeed(t *testing.T, svc UserService, users ...model.User) []model.User {
-	t.Helper()
-	out := make([]model.User, 0, len(users))
-	for _, u := range users {
-		s, err := svc.SaveUser(context.Background(), u)
-		if err != nil {
-			t.Fatalf("seed: %v", err)
-		}
-		out = append(out, s)
-	}
-	return out
-}
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 func TestSaveUser(t *testing.T) {
-	ctx := context.Background()
+	in := model.NewUserBuilder().Name("a").Build()
+	saved := model.NewUserBuilder().ID(7).Name("a").Build()
 	tests := []struct {
 		name    string
-		seed    []model.User
-		input   func(seeded []model.User) model.User
-		repoErr error
+		retErr  error
+		want    model.User
 		wantErr bool
-		check   func(t *testing.T, in, got model.User, seeded []model.User, r *tstFakeUserRepo)
 	}{
-		{
-			name:  "new user gets id and same fields",
-			input: func([]model.User) model.User { return tstUser("alice", "a@x") },
-			check: func(t *testing.T, in, got model.User, _ []model.User, r *tstFakeUserRepo) {
-				if got.ID == 0 {
-					t.Fatal("expected assigned id")
-				}
-				exp := in
-				exp.ID = got.ID
-				if !got.Equal(exp) {
-					t.Fatalf("got %v want %v", got, exp)
-				}
-				if len(r.snapshot()) != 1 {
-					t.Fatal("expected one stored record")
-				}
-			},
-		},
-		{
-			name: "existing id is overwritten (upsert)",
-			seed: []model.User{tstUser("bob", "b@x")},
-			input: func(s []model.User) model.User {
-				u := tstUser("bobby", "bb@x")
-				u.ID = s[0].ID
-				return u
-			},
-			check: func(t *testing.T, in, got model.User, s []model.User, r *tstFakeUserRepo) {
-				if got.ID != s[0].ID || !got.Equal(in) {
-					t.Fatalf("got %v want %v", got, in)
-				}
-				snap := r.snapshot()
-				if len(snap) != 1 || !snap[s[0].ID].Equal(in) {
-					t.Fatalf("record not overwritten: %v", snap)
-				}
-			},
-		},
-		{
-			name:    "persistence error propagates",
-			input:   func([]model.User) model.User { return tstUser("dup", "d@x") },
-			repoErr: errors.New("duplicate entry 1062"),
-			wantErr: true,
-		},
+		{"success returns repo result", nil, saved, false},
+		{"repo error wrapped", errDB, model.User{}, true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			svc, repo := tstNewSvc()
-			seeded := tstSeed(t, svc, tc.seed...)
-			repo.saveErr = tc.repoErr
-			in := tc.input(seeded)
-			got, err := svc.SaveUser(ctx, in)
+			r := &fakeRepo{saveRet: saved, saveErr: tc.retErr}
+			got, err := NewUserService(r).SaveUser(context.Background(), in)
+			if r.saveCalls != 1 {
+				t.Fatalf("save calls = %d, want 1", r.saveCalls)
+			}
+			if !r.saveArg.Equal(in) {
+				t.Errorf("save arg = %v, want %v", r.saveArg, in)
+			}
 			if tc.wantErr {
-				if !errors.Is(err, tc.repoErr) {
-					t.Fatalf("want %v, got %v", tc.repoErr, err)
+				if !errors.Is(err, errDB) {
+					t.Fatalf("err = %v, want wrapping errDB", err)
+				}
+				if IsNotFound(err) {
+					t.Error("unexpected NotFoundError")
 				}
 				return
 			}
 			if err != nil {
-				t.Fatal(err)
+				t.Fatalf("unexpected err %v", err)
 			}
-			tc.check(t, in, got, seeded, repo)
-			// invariant: retrievable by id
-			f, err := svc.FetchUserByID(ctx, got.ID)
-			if err != nil || !f.Equal(got) {
-				t.Fatalf("not retrievable: %v %v", f, err)
+			if !got.Equal(tc.want) {
+				t.Errorf("got %v, want %v", got, tc.want)
 			}
 		})
 	}
 }
 
 func TestFetchUserList(t *testing.T) {
+	users := []model.User{hemraj(), model.NewUserBuilder().ID(4).Name("b").Build()}
 	tests := []struct {
-		name string
-		seed []model.User
+		name    string
+		ret     []model.User
+		err     error
+		wantLen int
+		wantErr bool
 	}{
-		{"no users returns empty non-nil", nil},
-		{"returns every user", []model.User{tstUser("a", "a@x"), tstUser("b", "b@x"), tstUser("c", "c@x")}},
+		{"users exist", users, nil, 2, false},
+		{"nil becomes empty", nil, nil, 0, false},
+		{"empty slice", []model.User{}, nil, 0, false},
+		{"repo error", nil, errDB, 0, true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			svc, repo := tstNewSvc()
-			seeded := tstSeed(t, svc, tc.seed...)
-			before := repo.snapshot()
-			got, err := svc.FetchUserList(context.Background())
+			r := &fakeRepo{findAllRet: tc.ret, findAllErr: tc.err}
+			got, err := NewUserService(r).FetchUserList(context.Background())
+			if r.findAllCall != 1 {
+				t.Errorf("FindAll calls = %d", r.findAllCall)
+			}
+			if r.saveCalls != 0 || r.deleteCalls != 0 {
+				t.Error("read-only operation modified data")
+			}
+			if tc.wantErr {
+				if !errors.Is(err, errDB) {
+					t.Fatalf("err = %v", err)
+				}
+				return
+			}
 			if err != nil {
 				t.Fatal(err)
 			}
 			if got == nil {
-				t.Fatal("slice must not be nil")
+				t.Fatal("got nil slice")
 			}
-			if len(got) != len(seeded) {
-				t.Fatalf("len %d want %d", len(got), len(seeded))
+			if len(got) != tc.wantLen {
+				t.Fatalf("len = %d, want %d", len(got), tc.wantLen)
 			}
-			for _, s := range seeded {
-				found := false
-				for _, g := range got {
-					if g.Equal(s) {
-						found = true
-					}
+			for i := range got {
+				if !got[i].Equal(tc.ret[i]) {
+					t.Errorf("user %d = %v", i, got[i])
 				}
-				if !found {
-					t.Fatalf("missing %v", s)
-				}
-			}
-			if len(repo.snapshot()) != len(before) || repo.calls["Save"] != len(tc.seed) {
-				t.Fatal("read must not modify store")
 			}
 		})
 	}
 }
 
 func TestFetchUserByID(t *testing.T) {
-	svc, _ := tstNewSvc()
-	seeded := tstSeed(t, svc, tstUser("a", "a@x"), tstUser("b", "b@x"))
 	tests := []struct {
-		name    string
-		id      int32
-		want    *model.User
-		wantNF  bool
+		name         string
+		ok           bool
+		err          error
+		wantNotFound bool
+		wantErr      error
 	}{
-		{"existing first", seeded[0].ID, &seeded[0], false},
-		{"existing second", seeded[1].ID, &seeded[1], false},
-		{"missing", 9999, nil, true},
-		{"zero id", 0, nil, true},
+		{"found", true, nil, false, nil},
+		{"not found", false, nil, true, ErrUserNotFound},
+		{"repo error", false, errDB, false, errDB},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := svc.FetchUserByID(context.Background(), tc.id)
-			if tc.wantNF {
-				if !errors.Is(err, ErrUserNotFound) || !IsNotFound(err) {
-					t.Fatalf("want not found, got %v", err)
+			r := &fakeRepo{findByIDRet: hemraj(), findByIDOK: tc.ok, findByIDErr: tc.err}
+			got, err := NewUserService(r).FetchUserByID(context.Background(), 3)
+			if r.findByIDArg != 3 {
+				t.Errorf("FindByID arg = %d", r.findByIDArg)
+			}
+			if r.saveCalls != 0 || r.deleteCalls != 0 {
+				t.Error("read-only operation modified data")
+			}
+			if tc.wantErr == nil {
+				if err != nil {
+					t.Fatal(err)
 				}
-				var nf *NotFoundError
-				if !errors.As(err, &nf) || nf.Error() != UserNotFoundMessage {
-					t.Fatalf("bad message: %v", err)
+				if !got.Equal(hemraj()) {
+					t.Errorf("got %v", got)
 				}
 				return
 			}
-			if err != nil || !got.Equal(*tc.want) {
-				t.Fatalf("got %v %v", got, err)
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("err = %v, want %v", err, tc.wantErr)
+			}
+			if IsNotFound(err) != tc.wantNotFound {
+				t.Errorf("IsNotFound = %v", IsNotFound(err))
+			}
+			if tc.wantNotFound {
+				var nf *NotFoundError
+				if !errors.As(err, &nf) {
+					t.Fatal("not *NotFoundError")
+				}
+				if err.Error() != "User are not available" || err.Error() != UserNotFoundMessage {
+					t.Errorf("message = %q", err.Error())
+				}
+			}
+			if !got.Equal(model.User{}) {
+				t.Errorf("expected zero user on error, got %v", got)
 			}
 		})
 	}
 }
 
 func TestDeleteUser(t *testing.T) {
+	missing := fmt.Errorf("repository: delete user 9: %w", repository.ErrEmptyResult)
 	tests := []struct {
-		name      string
-		missing   bool
-		wantEmpty bool
+		name    string
+		id      int32
+		err     error
+		wantErr error
 	}{
-		{"existing user removed", false, false},
-		{"missing id returns ErrEmptyResult", true, true},
+		{"existing", 3, nil, nil},
+		{"missing", 9, missing, repository.ErrEmptyResult},
+		{"db error", 3, errDB, errDB},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			ctx := context.Background()
-			svc, _ := tstNewSvc()
-			s := tstSeed(t, svc, tstUser("a", "a@x"), tstUser("b", "b@x"))
-			id := s[0].ID
-			if tc.missing {
-				id = 4242
+			r := &fakeRepo{deleteErr: tc.err}
+			err := NewUserService(r).DeleteUser(context.Background(), tc.id)
+			if r.deleteCalls != 1 || r.deleteArg != tc.id {
+				t.Errorf("delete calls=%d arg=%d", r.deleteCalls, r.deleteArg)
 			}
-			err := svc.DeleteUser(ctx, id)
-			if tc.wantEmpty {
-				if !errors.Is(err, repository.ErrEmptyResult) {
-					t.Fatalf("want ErrEmptyResult, got %v", err)
-				}
-				if IsNotFound(err) {
-					t.Fatal("delete must not return NotFoundError")
-				}
-			} else {
+			if r.findByIDArg != 0 {
+				t.Error("service performed existence check")
+			}
+			if tc.wantErr == nil {
 				if err != nil {
 					t.Fatal(err)
 				}
-				if _, err := svc.FetchUserByID(ctx, id); !errors.Is(err, ErrUserNotFound) {
-					t.Fatalf("expected not found after delete, got %v", err)
-				}
+				return
 			}
-			other, err := svc.FetchUserByID(ctx, s[1].ID)
-			if err != nil || !other.Equal(s[1]) {
-				t.Fatal("other user affected")
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("err = %v", err)
+			}
+			if IsNotFound(err) {
+				t.Error("DeleteUser must not return NotFoundError")
 			}
 		})
 	}
@@ -384,42 +248,39 @@ func TestDeleteUser(t *testing.T) {
 func TestUpdateUser(t *testing.T) {
 	tests := []struct {
 		name    string
-		missing bool
+		id      int32
+		in      model.User
+		err     error
+		wantErr bool
 	}{
-		{"existing id updated", false},
-		{"missing id inserts new record", true},
+		{"different id overridden", 5, model.NewUserBuilder().ID(99).Name("x").Email("e").Build(), nil, false},
+		{"no id", 6, model.NewUserBuilder().Name("y").Build(), nil, false},
+		{"nonexistent id still saves", 1000, model.NewUserBuilder().Name("z").Build(), nil, false},
+		{"repo error", 5, model.NewUserBuilder().Name("x").Build(), errDB, true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			ctx := context.Background()
-			svc, repo := tstNewSvc()
-			s := tstSeed(t, svc, tstUser("a", "a@x"), tstUser("b", "b@x"))
-			upd := tstUser("new", "new@x")
-			upd.ID = 777 // must be overwritten by id argument
-			id := s[0].ID
-			if tc.missing {
-				id = 5000
+			r := &fakeRepo{saveErr: tc.err}
+			err := NewUserService(r).UpdateUser(context.Background(), tc.id, tc.in)
+			if r.saveCalls != 1 {
+				t.Fatalf("save calls = %d", r.saveCalls)
 			}
-			if err := svc.UpdateUser(ctx, id, upd); err != nil {
+			if r.findByIDArg != 0 {
+				t.Error("unexpected not-found check")
+			}
+			want := tc.in
+			want.ID = tc.id
+			if !r.saveArg.Equal(want) {
+				t.Errorf("saved %v, want %v", r.saveArg, want)
+			}
+			if tc.wantErr {
+				if !errors.Is(err, errDB) || IsNotFound(err) {
+					t.Fatalf("err = %v", err)
+				}
+				return
+			}
+			if err != nil {
 				t.Fatal(err)
-			}
-			if !tc.missing {
-				got, err := svc.FetchUserByID(ctx, id)
-				if err != nil || got.ID != id || *got.Name != "new" || *got.Email != "new@x" {
-					t.Fatalf("not updated: %v %v", got, err)
-				}
-				if len(repo.snapshot()) != 2 {
-					t.Fatal("update must not add records")
-				}
-				if _, ok := repo.snapshot()[777]; ok {
-					t.Fatal("id from body must not be used")
-				}
-			} else if len(repo.snapshot()) != 3 {
-				t.Fatalf("expected new record, got %d", len(repo.snapshot()))
-			}
-			other, _ := svc.FetchUserByID(ctx, s[1].ID)
-			if !other.Equal(s[1]) {
-				t.Fatal("other user affected")
 			}
 		})
 	}
@@ -427,26 +288,39 @@ func TestUpdateUser(t *testing.T) {
 
 func TestGetUserByName(t *testing.T) {
 	tests := []struct {
-		name      string
-		seed      []model.User
-		query     string
-		wantOK    bool
-		wantNonUq bool
+		name    string
+		query   string
+		ret     model.User
+		ok      bool
+		err     error
+		wantOK  bool
+		wantErr error
 	}{
-		{"match", []model.User{tstUser("alice", "a@x"), tstUser("bob", "b@x")}, "alice", true, false},
-		{"no match", []model.User{tstUser("alice", "a@x")}, "zed", false, false},
-		{"empty store", nil, "alice", false, false},
-		{"multiple match", []model.User{tstUser("dup", "1@x"), tstUser("dup", "2@x")}, "dup", false, true},
+		{"found hemraj", "hemraj", hemraj(), true, nil, true, nil},
+		{"not found", "nobody", model.User{}, false, nil, false, nil},
+		{"non unique", "dup", model.User{}, false,
+			fmt.Errorf("repository: find user by name: %w", repository.ErrNonUniqueResult), false, repository.ErrNonUniqueResult},
+		{"db error", "x", model.User{}, false, errDB, false, errDB},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			svc, repo := tstNewSvc()
-			tstSeed(t, svc, tc.seed...)
-			before := len(repo.snapshot())
-			got, ok, err := svc.GetUserByName(context.Background(), tc.query)
-			if tc.wantNonUq {
-				if !errors.Is(err, repository.ErrNonUniqueResult) {
-					t.Fatalf("want non-unique, got %v", err)
+			r := &fakeRepo{byNameRet: tc.ret, byNameOK: tc.ok, byNameErr: tc.err}
+			got, ok, err := NewUserService(r).GetUserByName(context.Background(), tc.query)
+			if r.byNameArg != tc.query {
+				t.Errorf("query arg = %q", r.byNameArg)
+			}
+			if r.saveCalls != 0 || r.deleteCalls != 0 {
+				t.Error("read-only operation modified data")
+			}
+			if tc.wantErr != nil {
+				if !errors.Is(err, tc.wantErr) || ok {
+					t.Fatalf("err=%v ok=%v", err, ok)
+				}
+				if IsNotFound(err) {
+					t.Error("unexpected NotFoundError")
+				}
+				if !strings.Contains(err.Error(), "get user by name") {
+					t.Errorf("err msg = %q", err.Error())
 				}
 				return
 			}
@@ -454,13 +328,15 @@ func TestGetUserByName(t *testing.T) {
 				t.Fatal(err)
 			}
 			if ok != tc.wantOK {
-				t.Fatalf("ok=%v want %v", ok, tc.wantOK)
+				t.Fatalf("ok = %v", ok)
 			}
-			if ok && (got.Name == nil || *got.Name != tc.query) {
-				t.Fatalf("name mismatch: %v", got)
-			}
-			if len(repo.snapshot()) != before {
-				t.Fatal("read must not modify store")
+			if ok {
+				if got.Name == nil || *got.Name != tc.query {
+					t.Errorf("name = %v", got.Name)
+				}
+				if got.ID != 3 || *got.Email != "hemrajmalhi1234@gmail.com" || *got.About != "Sr" || *got.Role != "java developer" {
+					t.Errorf("got %v", got)
+				}
 			}
 		})
 	}
