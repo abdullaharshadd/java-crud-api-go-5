@@ -3,8 +3,10 @@ package main
 import (
 	"context"
 	"database/sql"
+	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
@@ -53,6 +55,49 @@ func mysqlDSN(raw string) string {
 	return c.FormatDSN()
 }
 
+// applyDBEnvOverrides lets the discrete DB_HOST/DB_PORT/DB_USER/DB_PASSWORD/
+// DB_NAME environment variables take precedence over (or fill in for) the
+// corresponding parts of the DSN, so a stale host in DATABASE_URL does not
+// prevent connecting to the real database host.
+func applyDBEnvOverrides(dsn string) string {
+	c, err := mysql.ParseDSN(dsn)
+	if err != nil {
+		c = mysql.NewConfig()
+	}
+	host := firstEnv("DB_HOST", "MYSQL_HOST")
+	port := firstEnv("DB_PORT", "MYSQL_PORT")
+	if host != "" {
+		if port == "" {
+			if _, p, err := net.SplitHostPort(c.Addr); err == nil && p != "" {
+				port = p
+			} else {
+				port = "3306"
+			}
+		}
+		c.Net = "tcp"
+		c.Addr = net.JoinHostPort(host, port)
+	}
+	if v := firstEnv("DB_USER", "DB_USERNAME", "MYSQL_USER"); v != "" && c.User == "" {
+		c.User = v
+	}
+	if v := firstEnv("DB_PASSWORD", "MYSQL_PASSWORD"); v != "" && c.Passwd == "" {
+		c.Passwd = v
+	}
+	if v := firstEnv("DB_NAME", "DB_DATABASE", "MYSQL_DATABASE"); v != "" && c.DBName == "" {
+		c.DBName = v
+	}
+	return c.FormatDSN()
+}
+
+func firstEnv(keys ...string) string {
+	for _, k := range keys {
+		if v := strings.TrimSpace(os.Getenv(k)); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
 func openDB() *sql.DB {
 	cfg, err := config.Load()
 	if err != nil {
@@ -62,7 +107,7 @@ func openDB() *sql.DB {
 	if cfg.DatabaseURL == "" {
 		log.Warn().Msg("DATABASE_URL is not set")
 	}
-	db, err := sql.Open("mysql", mysqlDSN(cfg.DatabaseURL))
+	db, err := sql.Open("mysql", applyDBEnvOverrides(mysqlDSN(cfg.DatabaseURL)))
 	if err != nil {
 		log.Error().Err(err).Msg("failed to open database")
 		return db
